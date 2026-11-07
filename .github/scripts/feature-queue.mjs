@@ -5,6 +5,7 @@ const batchLabel = "feature-batch";
 const queueLabel = "feature-queue";
 const maxRows = 50;
 const maxFixRequests = 3;
+const isCopilot = (login) => (login ?? "").toLowerCase().includes("copilot");
 const fixMarker = "<!-- factory-ci-fix";
 const attachmentPrefix = "https://github.com/user-attachments/files/";
 const fence = "```";
@@ -160,7 +161,7 @@ async function importBatch() {
       body: JSON.stringify({
         title,
         body: (body ? body + "\n\n" : "") + "Queued from #" + number + ".",
-        labels: [...new Set(["feature", queueLabel, ...labels])],
+        labels: [...new Set(["feature", ...labels])],
       }),
     });
     created.push("- #" + featureIssue.number + " " + title);
@@ -170,9 +171,9 @@ async function importBatch() {
     method: "POST",
     body: JSON.stringify({
       body:
-        "Queued " +
+        "Created " +
         created.length +
-        " feature issues. Copilot works them in order, one at a time.\n\n" +
+        " feature issues. Approve them on the AI Code Factory project page (or add the feature-queue label) and Copilot builds them in order, one at a time.\n\n" +
         created.join("\n"),
     }),
   });
@@ -234,9 +235,10 @@ async function copilotFinished(pr) {
 async function requestFix(pr, reason) {
   const comments = await gh("/repos/" + repo + "/issues/" + pr.number + "/comments?per_page=100");
   const requests = comments.filter((comment) => comment.body?.includes(fixMarker));
-  if (requests.length >= maxFixRequests || requests.some((c) => c.body.includes(pr.head.sha))) {
+  if (requests.some((c) => c.body.includes(pr.head.sha))) return "working";
+  if (requests.length >= maxFixRequests) {
     console.log("#" + pr.number + " needs a person: " + reason);
-    return;
+    return "done";
   }
   await gh("/repos/" + repo + "/issues/" + pr.number + "/comments", {
     method: "POST",
@@ -252,6 +254,7 @@ async function requestFix(pr, reason) {
     }),
   });
   console.log("Asked Copilot to fix #" + pr.number + ".");
+  return "working";
 }
 
 async function startCi(pr) {
@@ -280,23 +283,23 @@ async function merge(pr) {
     });
   } catch (error) {
     if (error.status === 405) {
-      await requestFix(pr, "This pull request can't merge into " + pr.base.ref + "; merge " + pr.base.ref + " and resolve conflicts.");
-      return;
+      return requestFix(pr, "This pull request can't merge into " + pr.base.ref + "; merge " + pr.base.ref + " and resolve conflicts.");
     }
     if (error.status === 409) {
-      console.log("#" + pr.number + " changed while merging; the next run picks it up.");
-      return;
+      console.log("#" + pr.number + " changed while merging; retrying.");
+      return "waiting";
     }
     throw error;
   }
   await gh("/repos/" + repo + "/git/refs/heads/" + pr.head.ref, { method: "DELETE" }).catch(() => {});
   console.log("Merged #" + pr.number + "; Vercel deploys production.");
+  return "done";
 }
 
 async function shipPull(pr) {
   if (!(await copilotFinished(pr))) {
     console.log("#" + pr.number + ": Copilot is still working.");
-    return;
+    return "working";
   }
   if (pr.draft) {
     await graphql(
@@ -305,21 +308,22 @@ async function shipPull(pr) {
     );
     console.log("Marked #" + pr.number + " ready for review.");
   }
-  // Copilot-triggered runs wait for approval; only runs started by a person count.
+  // Runs started by Copilot may never start or report back without approval; only completed ones count.
   const { workflow_runs } = await gh(
     "/repos/" + repo + "/actions/workflows/ci.yml/runs?head_sha=" + pr.head.sha + "&per_page=50",
   );
   const runs = workflow_runs.filter((run) => run.conclusion !== "action_required");
   if (runs.some((run) => run.conclusion === "success")) return merge(pr);
-  if (runs.some((run) => run.status !== "completed")) {
+  if (runs.some((run) => run.status !== "completed" && !isCopilot(run.actor?.login))) {
     console.log("#" + pr.number + ": waiting for CI.");
-    return;
+    return "waiting";
   }
   const failed = runs.find((run) => ["failure", "timed_out"].includes(run.conclusion));
   if (failed) {
     return requestFix(pr, "CI failed on " + pr.head.sha.slice(0, 7) + ": " + failed.html_url + ".");
   }
   await startCi(pr);
+  return "waiting";
 }
 
 async function ship() {
@@ -327,13 +331,19 @@ async function ship() {
     console.log("Auto-merge is off (FEATURE_AUTO_MERGE=false).");
     return;
   }
-  const pulls = await gh("/repos/" + repo + "/pulls?state=open&per_page=100");
-  for (const pr of pulls.filter((p) => p.user.login.toLowerCase().includes("copilot"))) {
-    try {
-      await shipPull(pr);
-    } catch (error) {
-      console.error("#" + pr.number + ": " + error.message);
+  const deadline = Date.now() + Number(process.env.SHIP_WAIT_MINUTES || 25) * 60_000;
+  for (;;) {
+    const pulls = await gh("/repos/" + repo + "/pulls?state=open&per_page=100");
+    let pending = false;
+    for (const pr of pulls.filter((p) => isCopilot(p.user.login))) {
+      try {
+        if ((await shipPull(pr)) !== "done") pending = true;
+      } catch (error) {
+        console.error("#" + pr.number + ": " + error.message);
+      }
     }
+    if (!pending || Date.now() >= deadline) return;
+    await new Promise((resolve) => setTimeout(resolve, 30_000));
   }
 }
 
